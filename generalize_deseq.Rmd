@@ -1,0 +1,971 @@
+---
+title: "Generalizeable DESeq2 Functions"
+output: html_notebook
+---
+
+0.1 Set up working directory
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = DATA_ANALYSIS_DIRECTORY)
+getwd()
+```
+
+```{r check-wd}
+getwd()
+```
+
+Things to add: - lapply across x experimental comparisons - pairwise comparisons b/w non-wt samples - specify whether rld or vsd is better normalizing
+
+1.1 Call libraries
+
+```{r}
+
+myLibraries <- c("DESeq2",
+                 "tximport",
+                 "ensembldb",
+                 "EnsDb.Hsapiens.v75",
+                 "readr",
+                 "tximportData",
+                 "GenomicFeatures",
+                 suppressPackageStartupMessages("GenomicFeatures"),
+                 suppressPackageStartupMessages("SummarizedExperiment"),
+                 "pheatmap",
+                 "RColorBrewer",
+                 "biomaRt",
+                 "ggplot2",
+                 "DEGreport",
+                 "ggrepel",
+                 "tidyverse",
+                 "AnnotationDbi",
+                 "AnnotationHub",
+                 "RMariaDB",
+                 "dendextend",
+                 "vsn",
+                 "hexbin",
+                 "tximeta",
+                 "rtracklayer",
+                 "stringr",
+                 "jsonlite",
+                 "GenomeInfoDb",
+                 "magrittr",
+                 "genbankr",
+                 "rentrez",
+                 "BiocIO",
+                 "gsubfn",
+                 "reshape2",
+                 "stringr",
+                 "VennDiagram")
+
+invisible(lapply(myLibraries, library, ch = TRUE))
+
+```
+
+1.2 Import data from ENSEMBL
+
+```{r}
+
+# declare fxn
+  # human genome build from ensembl
+  # and annotation shenanigans part one 
+  fetchFromEnsembl <- function(org, rel) {
+    myDB <- makeTxDbFromEnsembl(organism = org, release = rel)
+    return(myDB)
+  }
+# call function if not yet loaded
+
+# checker var
+is_ensembl_loaded = exists("ensDBHg38")
+
+# if statement to check if ensembl loaded
+# for hg38 use the most recent release, so using "NA" as "rel"
+if (is_ensembl_loaded) {
+  print("ENSEMBL database loaded.")
+} else {
+  ensDBHg38 <- fetchFromEnsembl("Homo sapiens", NA)
+}
+
+```
+
+2.1-2.9 Declare functions
+
+```{r}
+# 2.1   list required input variables ----
+# directory, working (dir)                                       3.1
+# contains cDNA-alignments (store all your input files here)
+# contains output-files (go here to find your results)
+# akataGtfDir (where to find the GTF for akata)                  3.1
+# sample metadata - should always be samples.txt                 3.2
+# reference condition number (refNum)                            3.2
+# assembly, human (current functions only let you use Ensembl)   3.3
+# assembly, EBV                                                  4.2
+### List variables that will change by experiment
+# inputDir                                                       3.1
+# project name (projName)/sampleAttributes                       3.2
+# filenames for pairwise comparisons                             3.9a
+### Functions that save a file                                   2.4, 2.7, 2.8, 2.9
+
+# 2.2   declare functions to get sample metadata ----
+
+# get sample metadata
+# input is path to working directory
+# returns a table of sample metadata
+# recommend to call the output "samps"
+getSampleMetadata <- function(workingDir) {
+  # this fxn organizes the sample metadata from a premade table
+  # input a table listing each file in the set of samples
+  # one column must be named "trt" (may chagne later on)
+  # because right now my treatments are all trts
+  # and one column must be named "cond" as in condition
+  # get sample metadata
+  samples <- read.table(file.path(workingDir,"samples.txt"), header=TRUE)
+  samples$cond <- as.factor(samples$cond)
+  return(samples)
+  
+}
+
+# get sample attributes
+# note, condition 1 being WT is still the best functioning way to do this
+# but I should work on changing that.
+# inputs: project name (arbitrary), human genome build, EBV genome build,
+# samples dataframe, condition # of reference, 
+
+# get attributes by inputting the samples.txt data table
+getAttributes <- function(proj, human, ebv, samples, refNum) {
+  
+  statement <- paste0("Your project is named ", proj)
+  print(statement)
+  
+  # information about the reference condition
+  refName <- unique(samples$trt[which(samps$cond == refNum)])
+  
+  # get the metadata for all samples that are in the reference condition
+  refMeta <- samps[which(samps$trt == refName),]
+  refMeta
+  numRefCond <- unique(refMeta$cond)
+  numRefCond
+  
+  # information about the experimental condition(s)
+  expMeta <- samps[which(samps$trt != refName),]
+
+  # count the number of experimental conditions
+  numExpCond <- unique(expMeta$cond)
+
+  # get the names of the experimental conditions (as a list)
+  expNames <- unique(expMeta$trt)
+  
+  cat("Your reference treatment is:", refName, "\nYour experimental treatment(s) are:", expNames)
+
+  
+  meta <- list("projectName" = proj,
+            "refName" = refName, 
+            "numRefCond" = numRefCond, 
+            "expNames" = expNames, 
+            "numExpCond" = numExpCond,
+            "humanGenome" = human,
+            "ebvGenome" = ebv)
+  
+  return(meta)
+  
+}
+
+
+# fxn for getting file paths based on genome used
+# inputs are dir, genome, and nucType (type of nucleotide indexed)
+# currently options rae hg19 and akata
+# but whatever you have should work too 
+# genome is either hg19 or akata
+# nucType is either gDNA or cDNA
+getFilePaths <- function(dir, genome, nucType) {
+  fold <- paste0(genome, "_", nucType, "_alignments/") #, samps$run)
+  #  print(fold)
+  filename <- paste0(samps$run, "_quant.sf")
+  files <- file.path(dir, fold, filename)
+  return(files)
+  
+}
+# files <- getFilePaths(dir, "hg19", "cDNA")
+
+# 2.3   declare functions for human genome annotation ----
+
+# tximport [[ FROM ENSEMBL ONLY ]]
+preImport <- function(db, files) {
+  k <- keys(db, keytype = "TXNAME")
+  tx2gene <- AnnotationDbi::select(db, k, "GENEID", "TXNAME")
+  txi <- tximport(files, type = "salmon", 
+                  tx2gene = tx2gene,
+                  countsFromAbundance = "lengthScaledTPM",
+                  ignoreTxVersion = TRUE)
+  return(txi)
+}
+
+# get coldata for txi
+getColdata <- function(txi) {
+  cts <- txi$counts
+  cts <- cts[rowSums(cts) > 0, ]
+  coldata <- data.frame(files,
+                        names = paste0(samps$trt, "_", samps$rep),
+                        cond = samps$cond,
+                        trt = samps$trt,
+                        stringsAsFactors = FALSE
+  )
+  return(coldata)
+  
+}
+
+# 2.4   declare fxn to graph hg38-aligned data quality ----
+# save files with experiment-wide specific name
+# ie if the experiment is basically all about bcl6 KO
+# then give it some name that makes sense like bcl6KO
+# arguments w = datasetName variable; x = "arbitrary naming string", y = dataset
+saveMeanSdPlot <- function(datasetName, plotType, dataset) {
+  filename <- paste0(outputDir, "/", datasetName, "_", plotType, "_meanSdPlot.png")
+  cat(filename)
+  
+  # save a .png image of the graph
+  png(file = filename,
+      width = 600,
+      height = 350)
+  
+  meanSdPlot(assay(dataset))
+
+  dev.off()
+
+
+}
+#
+
+# for whatever reason tihs function and htis one only
+# is more consistent if I do dev.off() outside of the fxn
+savePCAPlot <- function(datasetName, plotType, dataset) {
+  
+  filename <- paste0(outputDir, "/", datasetName, "_", plotType, "_PCAPlot.png")
+  cat(filename)
+  
+  png(file = filename,
+      width = 600,
+      height = 350)
+  
+  plotPCA(dataset,
+          intgroup = "trt") +
+    theme_classic() +
+    scale_colour_discrete(name = "Treatment",
+                          labels = c(sampAttributes$refName, sampAttributes$expNames))
+  
+  # dev.off()
+  
+}
+#
+
+# make sample correlation heatmap
+makeSampleCorrelationHeatmap <- function(datasetName, plotType, dataset) {
+  vsd_mat <- assay(dataset)
+  vsd_mat <- vsd_mat[rowSums(vsd_mat) > 0,]
+  
+  vsd_cor <- cor(vsd_mat)
+  rownames(vsd_cor) <- paste0(samps$trt,
+                              "_rep_",
+                              samps$rep)
+  colnames(vsd_cor) <- rownames(vsd_cor)
+  
+  filename <- paste0(outputDir, "/", datasetName, "_", plotType, "_correlation.png")
+  filename
+  
+  png(file = filename,
+      width = 600,
+      height = 350)
+  
+  pheatmap(vsd_cor)
+  dev.off() 
+}
+#
+
+# make sample distribution heatmap
+makeSampleDistributionHeatmap <- function(datasetName, plotType, dataset) {
+  
+  sampleDists <- dist(t(assay(dataset)))
+  
+  sampleDistMatrix <- as.matrix(sampleDists)
+  rownames(sampleDistMatrix) <- vsd$trt
+  colnames(sampleDistMatrix) <- colnames(vsd)
+  colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+  
+  filename <- paste0(outputDir, "/", datasetName, "_", plotType, "_distribution.png")
+  filename
+  
+  png(file = filename,
+      width = 600,
+      height = 350)
+  
+  pheatmap(sampleDistMatrix,
+           clustering_distance_rows=sampleDists,
+           clustering_distance_cols=sampleDists,
+           col=colors)
+  
+  dev.off()
+  
+}
+#
+
+# 2.5   placeholder ----
+# 2.6   placeholder ----
+# 2.7   declare functions to get and plot pairwise results ----
+
+# get pairwise log2 fold change for each "exp" vs "wt" trt---
+# wt code commented out so i can come back to it later and change
+# to pairwise comparison of any two conditions
+getPairwiseLFC <- function(exp, ref, dds) { #}, wt) {
+  coef <- paste0("cond_", exp, "_vs_", ref) # "_vs_", wt)
+  print(coef)
+  lfcShrunk <- lfcShrink(dds,
+                         coef = coef,
+                         #                         coef = paste0("condition_", con1, "_", con2),
+                         type = "apeglm")
+  return(lfcShrunk)
+  
+}
+#
+
+# ggplot2 to make a volcano plots for LFC output
+# takes a few minutes to run 
+# inputs: x is the subset (delimited by "$") of the lapply output (a)
+# ie, a$x that you want to plot and the name "name" is
+# whatever you want to call the plot
+plotOutput <- function(x, name, xmax, ymax, genome){
+  # Visualize the comparison from the "compare" function
+  # Input is the result of the compare function
+  # Returns a ggplot2 object
+  xmin <- (xmax * -1)
+  
+  df <- as.data.frame(x)
+  df$ensembl_gene_id <- rownames(df)
+  rownames(df) <- NULL
+
+  x$ensembl_gene_id <- rownames(x)
+  rownames(x) <- NULL
+
+  g <- ggplot(data = df,
+              aes(x = log2FoldChange,
+                  y = -log10(padj),
+                  xmin = xmin, xmax = xmax,
+                  ymin = 0, ymax = ymax)) +
+    geom_point() +
+#    geom_text_repel(aes(label = ensembl_gene_id)) +
+    theme_classic()
+
+  ggsave(g, filename = paste0(outputDir, "/", sampAttributes$projectName, "_", genome, "_", name, "_unlabeled_volcano_plot.png"), height = 5, width = 5, device = "png")
+  print(paste0("Your volcano plot comparing treatment ", name, " to WT has been saved to ", outputDir))
+  
+
+}
+#
+
+# 2.8   declare functions to annotate genes via Ensembl db ----
+# Add annotations as desired
+# write to files
+
+# set up biomart with your chosen human genome build from Ensembl
+# get Anns meaning get Annotations
+getAnns <- function(dataset, biomart, version){
+  # return list of genes
+  # needs ensembl, biomarts
+  marts <- listMarts()
+  mart <- useEnsembl(dataset = dataset,
+                     biomart = biomart,
+                     version = version)
+  
+  myMart <- useDataset(dataset, mart = mart)
+  
+  attributes <- c("ensembl_transcript_id",
+                  "ensembl_gene_id",
+                  "chromosome_name",
+                  "start_position",
+                  "end_position",
+                  "hgnc_symbol",
+                  "description",
+                  "gene_biotype")
+  
+  genes <- getBM(attributes = attributes,
+                 values = rownames(normalized_counts),
+                 mart = myMart,
+                 useCache = FALSE)
+  #  head(genes, 10)
+  
+  genes1 <- genes[,c(2:8)]
+  return(genes1)
+}
+#
+
+# declare fxn to annotate genes
+annotateGenes <- function(dat, anns) {
+  dat$ensembl_gene_id = rownames(dat)
+  rownames(dat) = NULL
+  annotations <- merge(x = dat, 
+             y = anns, 
+             by = "ensembl_gene_id", 
+             all.x = TRUE, 
+             all.y = FALSE)
+  return(annotations)
+}
+#
+
+# declare function to annotate genes and save tables to files
+# makeAnnFiles includes the annotateGenes() function nested within it
+makeAnnFiles <- function(dat, anns, filename) {
+  file = paste0(outputDir, "/", filename, ".tsv")
+  
+  dat <- drop_na(dat)
+  data_ann <- annotateGenes(dat, anns)
+  data_ann <- unique(data_ann)
+  
+  write.table(data_ann,
+              file = file,
+              quote = FALSE,
+              sep = "\t",
+              row.names = FALSE)
+  
+  cat(file)
+  return(data_ann)
+}
+#
+
+# declare function to annotate genes and save tables to files
+# makeAnnFiles includes the annotateGenes() function nested within it
+# makeAnnFiles_CompleteCases <- function(dat, anns, filename) {
+#   
+#   cases <- complete.cases(dat)
+#   completed <- dat[cases, ]
+#   data_ann <- annotateGenes(completed, anns)
+#   data_ann <- unique(data_ann)
+#   
+#   write.table(data_ann,
+#               file = paste0(outputDir, filename, ".tsv"),
+#               quote = FALSE,
+#               sep = "\t",
+#               row.names = FALSE)
+# #  cat("your file was written to", paste0(outputDir, filename, ".tsv"))
+#   
+# #  return(data_ann)
+# }
+#
+
+# 2.9   declare fxns to get and visualize DEGs ----
+# declare function to identify DEGs
+getDEGs <- function(x, hgnc_symbol = hgnc_symbol) {
+  x$fc <- NA
+  x$sig <- NA
+  x$isDEG <- NA
+  
+  x$fc[which(x$log2FoldChange > 1)] <- "up"
+  x$fc[which(x$log2FoldChange < -1)] <- "down"
+  x$sig[which(x$padj < 0.05)] <- "yes"
+  
+  x$isDEG[which(x$fc == "up" & x$sig == "yes")] <- "red"
+    x$isDEG[which(x$fc == "down" & x$sig == "yes")] <- "green"
+      
+    x$name <- NA
+    x <- x[ ,!names(x) %in% c("ensembl_gene_id")]
+    
+    x <- x %>% mutate(name = ifelse(isDEG == "green" | isDEG == "red",
+                                    hgnc_symbol, NA))
+    x <- unique(x)
+    return(x)
+}
+#
+
+# plot DEGs 
+plotDEGs <- function(dat, xmax, ymax, genome) {
+  xmin = -1*(xmax)
+  name <- deparse(substitute(dat))
+  filename = paste0(outputDir, "/", sampAttributes$projectName, name, ".png")
+  
+  #
+  g <- ggplot(data = dat,
+              aes(x = log2FoldChange,
+                  y = -log10(padj),
+                  label = name,
+                  xmin = xmin, xmax = xmax,
+                  ymin = 0, ymax = ymax)) + #,
+    #                  color = isDEG)) +
+    geom_point() +
+    geom_text_repel() +
+    theme_classic() # +
+  # scale_shape_manual(name = "Expression change",
+  #                    labels = c("Down", "None", "Up"))
+  #  
+  
+  #
+  ggsave(filename, device = "png", height = 5, width = 6)
+  #
+  return(filename)
+}
+#
+
+
+```
+
+3.1-3.4 Set up environment and QC for data for hg38-aligned reads (Whole experiment) Note: Must choose vsd or rld after section 3.4a before proceeding!
+
+```{r}
+# 3.1   assign directories ----
+
+#check you're in the correct working directory
+getwd()
+
+# go one level into the directory for where all the input files are stored
+# note this is all cDNA (ie, RNA-seq) files
+
+# note this has to be hg38 or hg19 depending on genome build - rn it is hg38
+# inputDir <- paste0(dir, "/hg38_cDNA_alignments")
+
+inputDir <- (YOUR_DIRECTORY_NAME_HERE)
+list.files(inputDir)
+cat("Input files will be taken from", inputDir)
+
+# same for output files, meaning all graphs and plots and DESeq2 results
+outputDir <- paste0(dir, "/output_files")
+list.files(outputDir)
+cat("Output will appear in ", outputDir)
+
+# 3.2   get sample metadata and hg38 alignments -----
+
+# get sample metadata
+samps <- getSampleMetadata(dir)
+samps
+
+# first argument is project name, it's arbitrary
+sampAttributes <- as.list(getAttributes("PROJECT_NAME", "hg38", "akata", samps, 1))
+sampAttributes
+
+# extract reference treatment number and treatment name for use in colData 
+refNum <- sampAttributes$numRefCond
+names(refNum) <- c(sampAttributes$refName)
+refNum
+
+# same for the experimental treatment number and name
+expNums <- sampAttributes$numExpCond
+names(expNums) <- sampAttributes$expNames
+expNums
+
+# get hg38 cDNA transcriptome alignment file paths 
+files <- getFilePaths(dir, "hg38", "cDNA")
+cat("Please check that these are the quant files you want to analyze")
+files
+file.exists(files)
+
+# assign the project name to datasetName - include which genome
+projName <- sampAttributes$projectName
+datasetName <- paste0(projName, "_", sampAttributes$humanGenome)
+datasetName
+
+# 3.3   get hg38 transcriptome database ----
+
+
+# run preImport
+txi <- preImport(ensDBHg38, files)
+head(txi, 10)
+
+# get coldata for txi
+coldata <- getColdata(txi)
+
+# confirm that the directory is correct - should say "hg38" and "cDNA"
+# view coldata
+coldata
+
+# make DESeqDataSet
+myData <- DESeqDataSetFromTximport(txi, 
+                                colData = coldata,
+                                design = ~ cond)
+
+# 3.4a  visualize hg19-aligned data quality unblinded ----
+
+# check data quality with non-blinded data!
+# non norm transform data
+ntd <- normTransform(myData)
+
+# get mean SD plot
+saveMeanSdPlot(datasetName, "nonNormedData", ntd)
+# dev.off()
+
+# r log transform data, unblinded
+rldUnblind <- rlog(myData,
+            blind = FALSE)
+
+# make mean SD plot and PCA plot for this transform
+saveMeanSdPlot(datasetName, "rLogTransformedData_unblinded", rldUnblind)
+savePCAPlot(datasetName, "rLogTransformedData_unblinded", rldUnblind)
+# yes this dev.off is necessary
+dev.off()
+
+# Next up, variance stabilizing transform
+vsdUnblind <- vst(myData,
+           fitType = "local",
+           blind = FALSE)
+
+saveMeanSdPlot(datasetName, "varStabilizedData_unblinded", vsdUnblind)
+# dev.off()
+savePCAPlot(datasetName, "varStabilizedData_unblinded", vsdUnblind)
+dev.off()
+
+```
+
+Choose rld or vsd, run DESeq2, and plot normalized data
+
+```{r}
+# 3.4b  graph BLINDED data with best transformation for figures ----
+
+
+# Allow user to choose rld or vsd to graph blinded
+# and run normalization fxn either r-log or var staiblized
+
+normType <- ''
+
+if (normType == '') {
+  print("Please check the files in your output directory to decide \nwhich is the best normalization algorithm. \nr-log normalized or variance stabilized.")
+  var1 <- readline("Enter 1 for r-log normalizing; enter 2 for variance stabilizing transform: ")
+  
+  if (var1 == 1) {
+    normType <- "r_log"
+    print("You've chosen r-log normalization.")
+    normed <- rlog(myData,
+           fitType="local",
+           blind=TRUE)
+  } else if (var1 == 2) {
+    normType <- "var_stabilized"
+    print("You've chosen variance stabilized normalization.")
+    normed <- vst(myData,
+           fitType="local",
+           blind=TRUE)
+  }
+  
+} else {
+  print(paste0("You've already run ", normType, "normalization on your data."))
+}
+
+# 3.4c ----
+
+# make all graphs again with blind = true and user's chosen norm type
+
+blinded_normType <- paste0("blinded_", normType, "_normalized")
+# blinded_normType
+
+# save all plots needed
+saveMeanSdPlot(datasetName, normType, normed)
+savePCAPlot(datasetName, normType, normed)
+dev.off()
+makeSampleCorrelationHeatmap(datasetName, normType, normed)
+makeSampleDistributionHeatmap(datasetName, normType, normed)
+
+plotPCA(normed,
+        intgroup = "cond") +
+  theme_classic() +
+  scale_colour_discrete(name = "Treatment",
+                        labels = c(sampAttributes$refName, sampAttributes$expNames))
+
+
+  
+
+# 3.5   run DESeq2 ----
+
+# To run DESeq2 on dataset named ddsHg38
+dds <- DESeq(myData)
+
+# 3.6   plot normed counts ----
+### runs post-DESeq2
+normalized_counts <- counts(dds, normalized = TRUE)
+# fill in
+
+# make a filename
+filename <- paste0(outputDir, sampAttributes$projectName, "_", sampAttributes$humanGenome, "_normedCounts.png")
+filename
+#
+
+# save as a .png file
+png(file = filename,
+    width = 600,
+    height = 350)
+
+plotDispEsts(dds)
+dev.off()
+#
+
+```
+
+3.7-3.9 Analyze and annotate pairwise comparisons for hg38-aligned reads
+
+```{r}
+# 3.7   get and plot pairwise results ----
+
+# run getPairwiseLFC on all treatments vs WT-like
+pairCompare <- lapply(expNums, getPairwiseLFC, refNum, dds)
+
+# plot and get dataframe for each sample individually
+plotOutput(pairCompare$SAMPLE_COMPARISON, "SAMPLE_COMPARISON", 10, 100, sampAttributes$humanGenome)
+cond_2_vs_1_human <- as.data.frame(pairCompare$SAMPLE_COMPARISON)
+cond_2_vs_1_human$exon_id <- rownames(cond_2_vs_1_human)
+
+
+# 3.8   annotate human genes from ensembl ----
+
+# get annotations from Ensembl
+# dataset, biomart, version 
+# v110 is current 
+anns <- getAnns("hsapiens_gene_ensembl", "ensembl", 110)
+#
+# save annotation file
+# obj <- makeAnnFiles(as.data.frame(pairCompare$[condition]), anns, paste0(datasetName, "_[condition]", "_anns"))
+
+cond_2_vs_1_human_anns <- makeAnnFiles(as.data.frame(pairCompare$SAMPLE_COMPARISON), anns, paste0(datasetName, "SAMPLE_COMPARISON", "_anns"))
+
+
+# 3.9a  get differentially expressed genes ----
+
+# get human DEGs in each condition
+SAMPLE_DEGs <- getDEGs(cond_2_vs_1_human_anns)
+#
+
+# make a volcano plot with labeled DEGs
+plotDEGs(SAMPLE_DEGs, 10, 100, "hg38")
+#
+
+```
+
+4.1-4.6 Set up environment and process data for akata-aligned reads (Whole experiment)
+
+```{r}
+# 4.1   placeholder ----
+# 4.2   setup env to annotate Akata-aligned transcript reads ----
+# First confirm that section # 3.1 set up env --- has been run
+# get akata cDNA transcriptome alignment file paths 
+files <- getFilePaths(dir, "akata", "cDNA")
+files
+file.exists(files)
+
+# 4.3   get Akata transcriptome database ----
+# copy of ebv index file in both data-analysis and sequencing folders
+akataGtfDir <- WHERE_IS_THE_AKATA_GTF_FILE
+akata_gtf <- file.path(akataGtfDir, "akata.gtf")
+file.exists(akata_gtf)
+
+# make the TxDB for Akata in GTF format
+akataDB <- makeTxDbFromGFF(akata_gtf, format = "gtf")
+
+# create dict for transcripts and their gene name values
+k <- keys(akataDB, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(akataDB, k, "EXONID", "TXNAME")
+txi <- tximport(files, type = "salmon", 
+                tx2gene = tx2gene)
+(txi)
+
+# get coldata for txi
+coldata <- getColdata(txi)
+
+# confirm that the directory is correct - should say "akata" and "cDNA"
+# view coldata
+coldata
+
+# make DESeqDataSet
+myData <- DESeqDataSetFromTximport(txi, 
+                                    colData = coldata,
+                                    design = ~ cond)
+
+# assign the project name to datasetName - include which genome
+projName <- sampAttributes$projectName
+datasetName <- paste0(projName, "_", sampAttributes$ebvGenome)
+datasetName
+
+# 4.4a  visualize akata-aligned data quality unblinded ----
+
+# check data quality with non-blinded data!
+# non norm transform data
+ntd <- normTransform(myData)
+
+# get mean SD plot
+saveMeanSdPlot(datasetName, "nonNormedData", ntd)
+# dev.off()
+
+# r log transform data, unblinded
+rldUnblind <- rlog(myData,
+                   blind = FALSE,
+                   fitType = "local")
+
+# make mean SD plot and PCA plot for this transform
+saveMeanSdPlot(datasetName, "rLogTransformedData_unblinded", rldUnblind)
+savePCAPlot(datasetName, "rLogTransformedData_unblinded", rldUnblind)
+# yes this dev.off is necessary -for some reason pcaplot needs it
+dev.off()
+
+# Next up, variance stabilizing transform
+vsdUnblind <- varianceStabilizingTransformation(myData,
+                  fitType = "local",
+                  blind = FALSE)
+
+saveMeanSdPlot(datasetName, "varStabilizedData_unblinded", vsdUnblind)
+# dev.off()
+savePCAPlot(datasetName, "varStabilizedData_unblinded", vsdUnblind)
+dev.off()
+
+# 4.4b  graph BLINDED data with best transformation for figures ----
+
+#VSD looks like it fits better
+#so make all graphs again with blind = true
+rld <- rlog(myData,
+           fitType = "local",
+           blind = TRUE)
+
+# type of normalization applied
+normType <- "blinded_rLogNormalizedData"
+
+# save all plots needed
+saveMeanSdPlot(datasetName, normType, rld)
+savePCAPlot(datasetName, normType, rld)
+dev.off()
+
+# heatmaps of sample correlations and distributions
+makeSampleCorrelationHeatmap(datasetName, normType, rld)
+makeSampleDistributionHeatmap(datasetName, normType, rld)
+
+# PCA for the blinded VSD normalized data
+plotPCA(rld,
+        intgroup = "cond") +
+  theme_classic() +
+  scale_colour_discrete(name = "Treatment",
+                        labels = c(sampAttributes$refName, sampAttributes$expNames))
+
+dev.off()
+
+# 4.5   run DESeq ----
+
+# run DESeq
+dds <- DESeq(myData,
+             fitType = "local")
+
+# 4.6   get normed counts ----
+
+### runs post-DESeq
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# make a filename for the normed counts plot
+filename <- paste0(outputDir, sampAttributes$projectName, "_", sampAttributes$ebvGenome, "_normedCounts.png")
+filename
+
+# save as a .png file
+png(file = filename,
+    width = 600,
+    height = 350)
+
+plotDispEsts(dds)
+dev.off()
+
+
+```
+
+4.7-4.9 Analyze and annotate pairwise comparisons for akata-aligned reads
+
+```{r}
+# 4.7   get pairwise results ----
+
+# run getPairwiseLFC on all treatments vs WT-like
+# get hte pairwise log2 fold change and p-value 
+pairCompare <- lapply(expNums, getPairwiseLFC, refNum, dds)
+
+# plot output for each pairwise comparison
+plotOutput(pairCompare$SAMPLE1, "SAMPLE", 10, 100, sampAttributes$ebvGenome)
+cond_2_vs_1 <- as.data.frame(pairCompare$SAMPLE1)
+cond_2_vs_1$exon_id <- rownames(cond_2_vs_1)
+
+# condition 3 vs 1
+plotOutput(pairCompare$SAMPLE2, "SAMPLE", 10, 100, sampAttributes$ebvGenome)
+cond_3_vs_1 <- as.data.frame(pairCompare$SAMPLE2)
+cond_3_vs_1$exon_id <- rownames(cond_3_vs_1)
+
+# 4.8a extract EBV gene IDs to annotate pairwise comparison files ---- 
+
+# get the gene IDs - must repeat once per condition
+cond_2_vs_1_ebv_gene_ids <- merge(x = cond_2_vs_1, y = tx2gene, by.x = "exon_id", by.y = "EXONID")
+
+#save as .tsv file
+cond_2_vs_1_ebv_anns <- write_tsv(cond_2_vs_1_ebv_gene_ids, file = paste0(outputDir, datasetName, "_SAMPLE1", "_anns.tsv"))
+cond_2_vs_1_ebv_anns <- unique(cond_2_vs_1_ebv_anns[which(complete.cases(cond_2_vs_1_ebv_anns)),])
+
+# get the gene IDs - must repeat once per condition
+cond_3_vs_1_ebv_gene_ids <- merge(x = cond_3_vs_1, y = tx2gene, by.x = "exon_id", by.y = "EXONID")
+
+#save as .tsv file
+cond_3_vs_1_ebv_anns <- write_tsv(cond_3_vs_1_ebv_gene_ids, file = paste0(outputDir, datasetName, "_SAMPLE2", "_anns.tsv"))
+cond_3_vs_1_ebv_anns <- unique(cond_3_vs_1_ebv_anns[which(complete.cases(cond_3_vs_1_ebv_anns)),])
+
+# 4.9   get and visualize EBV DEGs ----
+# get list of diff expressed genes
+# not use hgnc_symbol so need to redo the function here to work with ebv 
+PQ_DEGs <- getDEGs(cond_2_vs_1_ebv_anns)
+ID_DEGs <- getDEGs(cond_3_vs_1_ebv_anns)
+#
+
+# make a volcano plot with labeled DEGs
+plotDEGs(PQ_DEGs, 4, 6, "akata")
+plotDEGs(ID_DEGs, 4, 6, "akata")
+#
+
+
+```
+
+5.1-5.x Additional functions
+
+```{r}
+# combine EBV and human annotations
+# add filler columns and format to EBV data so num cols is same between human and ebv
+cond_2_ebv_formatted <- cond_2_vs_1_ebv_anns
+cond_2_ebv_formatted$exon_id <- paste0("EBV", cond_2_ebv_formatted$exon_id)
+colnames(cond_2_ebv_formatted)[1] <- c("ensembl_gene_id")
+cond_2_ebv_formatted$TXNAME <- gsub(".{2}$", "", cond_2_ebv_formatted$TXNAME)
+colnames(cond_2_ebv_formatted)[7] <- c("hgnc_symbol")
+cond_2_ebv_formatted$chromosome_name <- "ebv"
+cond_2_ebv_formatted[c("start_position", "end_position", "description", "gene_biotype")] <- NA
+cond_2_ebv_formatted <- cond_2_ebv_formatted[,c(1,2,3,4,5,6,8,9,10,7,11,12)]
+
+# rbind the human and ebv df's
+cond_2_ebv_and_human_anns <- rbind(cond_2_vs_1_human_anns, cond_2_ebv_formatted)
+colnames(cond_2_ebv_and_human_anns)[c(1,10)] <- c("gene_id", "gene_symbol")
+
+# put gene symbol at the front 
+cond_2_ebv_and_human_anns <- cond_2_ebv_and_human_anns[,c(10,1:9,11,12)]
+
+# condition3
+cond_3_ebv_formatted <- cond_3_vs_1_ebv_anns
+cond_3_ebv_formatted$exon_id <- paste0("EBV", cond_3_ebv_formatted$exon_id)
+colnames(cond_3_ebv_formatted)[1] <- c("ensembl_gene_id")
+cond_3_ebv_formatted$TXNAME <- gsub(".{2}$", "", cond_3_ebv_formatted$TXNAME)
+colnames(cond_3_ebv_formatted)[7] <- c("hgnc_symbol")
+cond_3_ebv_formatted$chromosome_name <- "ebv"
+cond_3_ebv_formatted[c("start_position", "end_position", "description", "gene_biotype")] <- NA
+cond_3_ebv_formatted <- cond_3_ebv_formatted[,c(1,2,3,4,5,6,8,9,10,7,11,12)]
+
+# rbind the human and ebv df's
+cond_3_ebv_and_human_anns <- rbind(cond_3_vs_1_human_anns, cond_3_ebv_formatted)
+colnames(cond_3_ebv_and_human_anns)[c(1,10)] <- c("gene_id", "gene_symbol")
+
+# rbind the human and ebv df's
+cond_3_ebv_and_human_anns <- cond_3_ebv_and_human_anns[,c(10,1:9,11,12)]
+
+
+# okay now make a list for each of the gene symbols that satisfy the requirement
+# lfc >= 1 and padj < 0.05
+
+cond_2_combined_DEGs <- cond_2_ebv_and_human_anns$gene_symbol[which(cond_2_ebv_and_human_anns$log2FoldChange > 1 & cond_2_ebv_and_human_anns$padj < 0.05)]
+
+cond_3_combined_DEGs <- cond_3_ebv_and_human_anns$gene_symbol[which(cond_3_ebv_and_human_anns$log2FoldChange > 1 & cond_3_ebv_and_human_anns$padj < 0.05)]
+
+# venn diagram with colorblind friendly hex colors 
+venn.diagram(
+  x = list(cond_2_combined_DEGs, cond_3_combined_DEGs),
+  category.names = c("Sample 1 DEGs", "Sample 2 DEGs"),
+  filename = "output_files/PQ_vs_ID_DEGs.png",
+  output = TRUE,
+  col=c("#D81B60", "#1E88E5"),
+  fill=c(alpha("#D81B60",0.3), alpha("#1E88E5", 0.3))
+  
+)
+
+
+```
